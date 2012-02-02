@@ -1,6 +1,6 @@
 Meteor.startup(function () {
   if (! amplify.store("splash")) {
-    $('body').append(Template.splash());
+    $('body').append(Meteor.ui.render(Template.splash));
   }
 });
 
