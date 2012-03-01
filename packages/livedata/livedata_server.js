@@ -6,6 +6,7 @@ Meteor._ServerMethodInvocation = function (name, handler) {
   var self = this;
 
   self._enclosing = null;
+  self._session = null;
   self.isSimulation = null;
   self._name = name;
   self._handler = handler;
@@ -96,6 +97,15 @@ _.extend(Meteor._ServerMethodInvocation.prototype, {
     self._callback && self._callback(error, ret);
   },
 
+  setUser: function (user) {
+    var self = this;
+    if (!self._session)
+      throw new Error("This request doesn't originate from a remote client, " +
+                      "so it's not possible to set auth credentials.")
+    self.user = user;
+    self._session.setUser(user);
+  },
+
   // entry point
   // - returns the immediate value (or throws an exception)
   // - in any case, calls callback (if truthy) with eventual result
@@ -104,12 +114,16 @@ _.extend(Meteor._ServerMethodInvocation.prototype, {
   // - 'name' is for exception reporting
   // - 'next' will be called when it's OK to start the next method from
   //   this client
-  _run: function (args, callback, next) {
+  // - 'session' is a LivedataSession if this is a top-level call from a
+  //   remote client
+  _run: function (args, callback, next, session) {
     var self = this;
     self._callback = callback;
     self._next = next;
     self._enclosing = Meteor._CurrentInvocation.get();
     self.isSimulation = !!(self._enclosing && self._enclosing.isSimulation);
+    self._session = session || (self._enclosing && self._enclosing.session);
+    self.user = self._session && self._session.user || null;
 
     try {
       var ret = Meteor._CurrentInvocation.withValue(self, function () {
@@ -155,12 +169,14 @@ Meteor._LivedataSession = function (server) {
 
   self.out_queue = [];
 
+  self.user = null;
+
   // id of invocation => {result or error, when}
   self.result_cache = {};
 
   // Sub objects for active subscriptions
-  self.named_subs = {};
-  self.universal_subs = [];
+  self.named_subs = {}; // map from id to {sub, handler, params}
+  self.universal_subs = []; // array of {sub, handler}
 
   self.next_sub_priority = 0;
 
@@ -185,10 +201,17 @@ _.extend(Meteor._LivedataSession.prototype, {
     });
     self.out_queue = [];
 
+    // to avoid confusion (did my login message actually hit the
+    // server and execute, or not?), auth doesn't survive
+    // reconnect. client is expected to resend it.
+    self.user = null;
+
     // On initial connect, spin up all the universal publishers.
     if (!self.initialized) {
       self.initialized = true;
+      // XXX must this/should this be in a fiber?
       Fiber(function () {
+        // start all universal subscriptions
         _.each(self.server.universal_publish_handlers, function (handler) {
           self._startSubscription(handler, self.next_sub_priority--);
         });
@@ -264,6 +287,15 @@ _.extend(Meteor._LivedataSession.prototype, {
     if (offending_message)
       msg.offending_message = offending_message;
     self.send(msg);
+  },
+
+  // Set the current user. Future method invocations will see the new
+  // value. Also, all subscriptions will be immediately rerun to pick
+  // up the new value.
+  setUser: function (user) {
+    var self = this;
+    self.user = user;
+    self._restartAllSubscriptions();
   },
 
   // Throw 'msg' into the queue to be processed as an incoming
@@ -417,10 +449,11 @@ _.extend(Meteor._LivedataSession.prototype, {
         self._tryProcessNext()
       };
 
-      var invocation = new Meteor._ServerMethodInvocation(msg.method, handler);
+      var invocation =
+        new Meteor._ServerMethodInvocation(msg.method, handler);
       try {
         Meteor._CurrentWriteFence.withValue(fence, function () {
-          invocation._run(msg.params || [], callback, next);
+          invocation._run(msg.params || [], callback, next, self);
         });
       } catch (e) {
         // _run will have already logged the exception (and told the
@@ -432,11 +465,12 @@ _.extend(Meteor._LivedataSession.prototype, {
   _startSubscription: function (handler, priority, sub_id, params) {
     var self = this;
 
-    var sub = new Meteor._LivedataSubscription(self, sub_id, priority);
+    var sub = new Meteor._LivedataSubscription(self, sub_id, priority,
+                                               self.user);
     if (sub_id)
-      self.named_subs[sub_id] = sub;
+      self.named_subs[sub_id] = {handler: handler, params: params, sub: sub};
     else
-      self.universal_subs.push(sub);
+      self.universal_subs.push({handler: handler, sub: sub});
 
     var res = handler.apply(sub, params || []);
 
@@ -452,7 +486,7 @@ _.extend(Meteor._LivedataSession.prototype, {
     var self = this;
 
     if (sub_id && self.named_subs[sub_id]) {
-      self.named_subs[sub_id].stop();
+      self.named_subs[sub_id].sub.stop();
       delete self.named_subs[sub_id];
     }
   },
@@ -461,15 +495,42 @@ _.extend(Meteor._LivedataSession.prototype, {
   _stopAllSubscriptions: function () {
     var self = this;
 
-    _.each(self.named_subs, function (sub, id) {
-      sub.stop();
+    _.each(self.named_subs, function (s, id) {
+      s.sub.stop();
     });
     self.named_subs = {};
 
-    _.each(self.universal_subs, function (sub) {
-      sub.stop();
+    _.each(self.universal_subs, function (s) {
+      s.sub.stop();
     });
     self.universal_subs = [];
+  },
+
+  // stop and restart all subscriptions (for example, to pick up an
+  // auth change)
+  // XXX in the raw interface, might want to consider allowing
+  // subscriptions to catch this event, rather than being forced to be
+  // rerun
+  _restartAllSubscriptions: function () {
+    var self = this;
+
+    // Save off enough information to recreate the subs
+    var subs = []; // keys: handler, params, id, priority
+    _.each(self.named_subs, function (s, id) {
+      subs.push({handler: s.handler, params: s.params, id: id,
+                 priority: s.sub.priority});
+    });
+    _.each(self.universal_subs, function (s) {
+      subs.push({handler: s.handler, priority: s.sub.priority});
+    });
+
+    // Kill
+    self._stopAllSubscriptions();
+
+    // Restart
+    _.each(subs, function (s) {
+      self._startSubscription(s.handler, s.priority, s.id, s.params);
+    });
   },
 
   // return the current value for a particular key, as given by the
@@ -491,6 +552,7 @@ _.extend(Meteor._LivedataSession.prototype, {
 
     return authority.snapshot[collection_name][id][key];
   }
+
 });
 
 /******************************************************************************/
@@ -498,7 +560,10 @@ _.extend(Meteor._LivedataSession.prototype, {
 /******************************************************************************/
 
 // ctor for a sub handle: the input to each publish function
-Meteor._LivedataSubscription = function (session, sub_id, priority) {
+Meteor._LivedataSubscription = function (session, sub_id, priority, user) {
+  // Logged-in user for subscription. Public.
+  this.user = user;
+
   // LivedataSession
   this.session = session;
 
