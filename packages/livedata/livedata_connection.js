@@ -453,6 +453,11 @@ _.extend(Meteor._LivedataConnection.prototype, {
     }
     if (!m) {
       // XXX write a better error
+
+      // XXX we will print this message spuriously if we replay a
+      // message and the server replays the response, which might
+      // happen during session resumption. need to figure out how to
+      // deal with this heuristically to suppress the error.
       Meteor._debug("Can't interpret method response message");
       return;
     }
