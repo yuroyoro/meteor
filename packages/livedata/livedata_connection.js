@@ -4,6 +4,7 @@ Meteor._ClientMethodInvocation = function (name, handler) {
   // XXX need: user, setRestartHook, setUser (simulated??)
 
   self._enclosing = null;
+  self.user = null;
   self.isSimulation = null;
   self._name = name;
   self._handler = handler;
@@ -18,11 +19,13 @@ _.extend(Meteor._ClientMethodInvocation.prototype, {
     throw new Error("Simulated methods may not be asynchronous");
   },
 
-  _run: function (args, callback, enqueue) {
+  // callback is optional
+  _run: function (args, callback, enqueue, user) {
     var self = this;
     self._enclosing = Meteor._CurrentInvocation.get();
     self._callback = callback;
     self.isSimulation = true; // NB: refers to child invocations, not to us
+    self.user = user;
 
     // run locally (if we have a stub for it)
     if (self._handler) {
@@ -76,9 +79,17 @@ Meteor._LivedataConnection = function (url, restart_on_update) {
   self.stores = {}; // name -> object with methods
   self.method_handlers = {}; // name -> func
   self.next_method_id = 1;
-  self.outstanding_methods = []; // each item has keys: msg, callback
+  // each item has keys: msg, (optionally) callback, is_auth. if
+  // is_auth is true, then if msg.id is present, it is an actual
+  // in-flight RPC, else it is a template in case we need to resend
+  // the auth later and the only values in msg that matter are 'name'
+  // and 'params'
+  self.outstanding_methods = [];
+  self.cancelled_methods = {}; // map from method_id -> true
   self.unsatisfied_methods = {}; // map from method_id -> true
   self.pending_data = []; // array of pending data messages
+  self._user = null; // current user (underscore to avoid name collision)
+  self.user_deps = {}; // invalidation contexts listening to _user
   self.queued = {}; // name -> updates for (yet to be created) collection
   self.quiesce_callbacks = [];
   self.retry_migrate = null; // if we're blocking a migration, the retry func
@@ -107,7 +118,7 @@ Meteor._LivedataConnection = function (url, restart_on_update) {
     }
 
     var methods = _.map(self.outstanding_methods, function (m) {
-      return {msg: m.msg};
+      return {msg: m.msg, is_auth: m.is_auth};
     });
 
     return [true, {next_method_id: self.next_method_id,
@@ -167,7 +178,25 @@ Meteor._LivedataConnection = function (url, restart_on_update) {
 
     // Send pending methods.
     _.each(self.outstanding_methods, function (m) {
-      self.stream.send(JSON.stringify(m.msg));
+      var msg = m.msg;
+      if (m.is_auth) {
+        if (msg.id)
+          // This was an auth request that was in flight when we
+          // disconnected. We'll give it a new id when we reinvoke it
+          // -- we don't want it to hit the replay cache. We need it
+          // to be reinvoked so it will correctly set the auth for the
+          // methods that follow. (Note the old id so that, if the
+          // server actually gets around responding to the old
+          // request, we don't repost it.)
+          self.cancelled_methods[msg.id] = true;
+        else
+          /* it's an auth placeholder */;
+        msg.msg = 'method';
+        msg.id = ''+(self.next_method_id++);
+        self.unsatisfied_methods[msg.id] = true; // for consistency
+      }
+
+      self.stream.send(JSON.stringify(msg));
     });
 
     // add new subscriptions at the end. this way they take effect after
@@ -292,6 +321,26 @@ _.extend(Meteor._LivedataConnection.prototype, {
   },
 
   apply: function (name, args, callback) {
+    return this.apply_or_auth(name, args, callback);
+  },
+
+  // special form of 'apply' for requesting authentication. what's
+  // special about it is (1) you're given a hook to set the 'user'
+  // property on the Livedata connection when the request returns; (2)
+  // you can arrange for your request (or a variant of it) to be
+  // resent at an appropriate time if we have to reestablish the
+  // connection.
+  //
+  // you must give a callback, and it should return null if auth
+  // failed (no-op, won't be resent on reconnect), or else an object with:
+  // - user: the user that we're now logged in as
+  // - name, params: the method to invoke (ignoring the result) if we
+  //   have to reconnect, in order to re-establish the auth
+  auth: function (name, args, callback) {
+    return this.apply_or_auth(name, args, callback, true);
+  },
+
+  apply_or_auth: function (name, args, callback, is_auth) {
     var self = this;
     var enclosing = Meteor._CurrentInvocation.get();
     var handler = self.method_handlers[name];
@@ -304,20 +353,18 @@ _.extend(Meteor._LivedataConnection.prototype, {
         Meteor._debug("Exception while delivering result of invoking '" +
                       name + "'", e.stack);
       });
-    else
-      callback = function () {};
 
     var enqueue = function (msg, callback) {
       msg.id = '' + (self.next_method_id++);
       self.outstanding_methods.push({
-        msg: msg, callback: callback});
+        msg: msg, callback: callback, is_auth: !!is_auth});
       self.unsatisfied_methods[msg.id] = true;
       self.stream.send(JSON.stringify(msg));
     };
 
     var invocation = new Meteor._ClientMethodInvocation(name, handler, self);
     // if _run throws an exception, allow it to propagate
-    return invocation._run(args, callback, enqueue);
+    return invocation._run(args, callback, enqueue, self._user);
   },
 
   status: function () {
@@ -328,6 +375,21 @@ _.extend(Meteor._LivedataConnection.prototype, {
   reconnect: function () {
     var self = this;
     return self.stream.reconnect();
+  },
+
+  // return the currently logged in user (value) as a reactive variable
+  user: function () {
+    var self = this;
+    var ctx = Meteor.deps && Meteor.deps.Ctx.current;
+
+    if (context && !(context.id in self.user_deps)) {
+      self.user_deps[context.id] = context;
+      context.on_invalidate(function (ctx) {
+        delete self.user_deps[context.id];
+      });
+    }
+
+    return self._user;
   },
 
   // called when we are up-to-date with the server. intended for use
@@ -444,35 +506,78 @@ _.extend(Meteor._LivedataConnection.prototype, {
     var self = this;
     // id, result or error. error has error (code), reason, details
 
+    var findOffset = function (id) {
+      // should be O(1) in nearly all realistic use cases
+      for (var i = 0; i < self.outstanding_methods.length; i++) {
+        var m = self.outstanding_methods[i];
+        if (m.msg.id === msg.id)
+          return i;
+      }
+    };
+
     // find the outstanding request
-    // should be O(1) in nearly all realistic use cases
-    for (var i = 0; i < self.outstanding_methods.length; i++) {
-      var m = self.outstanding_methods[i];
-      if (m.msg.id === msg.id)
-        break;
-    }
+    var i = findOffset(msg.id);
+    var m = self.outstanding_methods[i];
     if (!m) {
       // XXX write a better error
 
-      // XXX we will print this message spuriously if we replay a
-      // message and the server replays the response, which might
-      // happen during session resumption. need to figure out how to
-      // deal with this heuristically to suppress the error.
-      Meteor._debug("Can't interpret method response message");
+      if (self.cancelled_methods[msg.id])
+        // we're deliberately ignoring this result
+        delete self.cancelled_methods[msg.id];
+      else {
+        // XXX we will print this message spuriously if we replay a
+        // message and the server replays the response, which might
+        // happen during session resumption. need to figure out how to
+        // deal with this heuristically to suppress the error.
+        Meteor._debug("Can't interpret method response message");
+      }
       return;
     }
 
-    // remove
-    self.outstanding_methods.splice(i, 1);
-
     // deliver result
+    var ret;
     if (m.callback) {
       // callback will have already been bindEnvironment'd by apply(),
       // so no need to catch exceptions
       if ('error' in msg)
-        m.callback(msg.error);
+        ret = m.callback(msg.error);
       else
-        m.callback(undefined, msg.result);
+        ret = m.callback(undefined, msg.result);
+    }
+
+    // just in case the callback somehow changed the array?
+    i = findOffset(msg.id);
+
+    // remove (and handle successful auth)
+    if (m.is_auth && ret) {
+      self._user = ret.user;
+      for (var id in self.user_deps)
+        self.user_deps[id].invalidate();
+
+      // keep in list, but turn it into an auth placeholder
+      self.outstanding_methods[i] =
+        {is_auth: true,
+         msg: {name: ret.name, params: ret.params}};
+    } else
+      // remove
+      self.outstanding_methods.splice(i, 1);
+
+    // compact (remove unneeded auth markers)
+    // XXX efficiency -- is O(N), could be O(1)
+    for (var i = 0; i < self.outstanding_methods.length - 1; i++) {
+      var me = self.outstanding_methods[i];
+      var next = self.outstanding_methods[i + 1];
+      if (me.is_auth && !('id' in me.msg) &&
+          next.is_auth && !('id' in next.msg)) {
+        // Two adjacent auth placeholders. The first one is
+        // redundant. Delete it. (If the second one is an actual live
+        // auth request, we still can't delete the first one because
+        // the second one might fail and get removed -- unless the
+        // *following* item is an auth placeholder, but that's too
+        // unusual to optimize.)
+        self.outstanding_methods.splice(i, 1);
+        i--;
+      }
     }
 
     // if we were blocking a migration, see if it's now possible to

@@ -7,6 +7,7 @@ Meteor._ServerMethodInvocation = function (name, handler) {
 
   self._enclosing = null;
   self._session = null;
+  self.user = null;
   self.isSimulation = null;
   self._name = name;
   self._handler = handler;
