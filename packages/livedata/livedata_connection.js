@@ -380,11 +380,11 @@ _.extend(Meteor._LivedataConnection.prototype, {
   // return the currently logged in user (value) as a reactive variable
   user: function () {
     var self = this;
-    var ctx = Meteor.deps && Meteor.deps.Ctx.current;
+    var context = Meteor.deps && Meteor.deps.Context.current;
 
     if (context && !(context.id in self.user_deps)) {
       self.user_deps[context.id] = context;
-      context.on_invalidate(function (ctx) {
+      context.on_invalidate(function (context) {
         delete self.user_deps[context.id];
       });
     }

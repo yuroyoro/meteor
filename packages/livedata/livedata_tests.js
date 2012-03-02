@@ -26,12 +26,13 @@ _.extend(ExpectationManager.prototype, {
 
     return function (/* arguments */) {
       if (typeof expected === "function")
-        expected.apply({}, arguments);
+        var ret = expected.apply({}, arguments);
       else
         self.test.equal(_.toArray(arguments), expected);
 
       self.outstanding--;
       self._check_complete();
+      return ret;
     };
   },
 
@@ -233,6 +234,105 @@ testAsyncMulti("livedata - compound methods", [
     });
   }
 ]);
+
+if (Meteor.is_client) {
+  var summarizePantry = function () {
+    var ret = {};
+    Pantry.find().forEach(function (item) {
+      ret[item.what] = item.quantity;
+    });
+    return ret;
+  };
+
+  testAsyncMulti("livedata - auth", [
+    function (test, expect) {
+      console.log("X1");
+      App.auth('logout', [], expect(function (err, res) {
+        console.log("Y1");
+        test.equal(err, undefined);
+        test.equal(res, undefined);
+        return {
+          user: null,
+          method: 'logout',
+          params: []
+        };
+      }));
+
+      console.log("X2");
+      Meteor.subscribe("my_pantry", test.runId(), expect(function () {
+        console.log("Z1");
+      }));
+      Pantry.insert({who: "alice", what: "apples", quantity: 10, world: test.runId()});
+      Pantry.insert({who: "alice", what: "oranges", quantity: 7, world: test.runId()});
+      Pantry.insert({who: "bob", what: "tangelos", quantity: 20, world: test.runId()});
+      Pantry.insert({who: "bob", what: "orangelos", quantity: 2, world: test.runId()});
+      console.log("X3");
+    },
+    function (test, expect) {
+      var release = expect();
+      console.log("AA1");
+      App.onQuiesce(function () {
+        console.log("ZZ1");
+        test.isTrue(_.isEqual(summarizePantry(), {}));
+        release();
+      });
+    },
+    function (test, expect) {
+      test.equal(App.user(), null);
+      var ret =
+        App.auth('login', ['alice', true], expect(function (err, res) {
+          test.equal(err, undefined);
+          test.equal(res, true);
+          return {
+            user: 'alice123',
+            method: 'relogin',
+            params: 'xxalice'
+          }
+        }));
+      test.equal(ret, undefined);
+      test.equal(App.user(), null);
+    },
+    function (test, expect) {
+      var release = expect();
+      App.onQuiesce(function () {
+        test.equal(App.user(), "alice123");
+        test.isTrue(_.isEqual(summarizePantry(), {apples: 10, oranges: 7}));
+        Meteor.defer(release);
+      });
+    },
+    function (test, expect) {
+      var ret = App.call('read_auth', expect(undefined, "alice"));
+      test.equal(ret, "alice123");
+    },
+    function (test, expect) {
+      App.auth('login', ['bob', true], expect(function (err, res) {
+        test.equal(err, undefined);
+        test.equal(res, true);
+        return {
+          user: 'bob123',
+          method: 'relogin',
+          params: 'xxbob'
+        }
+      }));
+    },
+    function (test, expect) {
+      var release = expect();
+      App.onQuiesce(function () {
+        test.equal(App.user(), "bob123");
+        test.isTrue(_.isEqual(summarizePantry(), {tangelos: 20, orangelos: 2}));
+
+        Meteor.defer(release);
+      });
+    }
+  ]);
+}
+// XXX try rerunning subscriptions
+
+
+// XXX XXX for auth test -- try reconnecting twice in a row. not sure
+// I got that right.
+
+
 
 
 // XXX some things to test in greater detail:

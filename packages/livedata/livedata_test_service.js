@@ -59,3 +59,54 @@ App.methods({
     Meteor.refresh({collection: 'ledger', world: world});
   }
 });
+
+/*****/
+
+Pantry = new Meteor.Collection("pantry");
+
+Meteor.startup(function () {
+  if (Meteor.is_server)
+    Pantry.remove({}); // XXX can this please be Pantry.remove()?
+});
+
+if (Meteor.is_server) {
+  App.methods({
+    'logout': function () {
+      this.setUser(null);
+    },
+
+    'login': function (who, succeed) {
+      if (succeed) {
+        this.setUser(who);
+        return true;
+      } else {
+        this.error(401, "Not authorized");
+      }
+    },
+
+    'relogin': function (token) {
+      if (token.length > 2) {
+        var who = token.substr(2);
+        this.setUser(who);
+        return who;
+      } else {
+        this.error(401, "Bad token");
+      }
+    }
+  });
+
+  Meteor.publish("my_pantry", function (world) {
+    if (!this.user) {
+      this.complete();
+      this.flush();
+      return;
+    }
+    return Pantry.find({who: this.user, world: world});
+  });
+}
+
+App.methods({
+  'read_auth': function () {
+    return this.user;
+  }
+});
