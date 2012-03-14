@@ -23,6 +23,7 @@ Meteor.Collection = function (name, manager, driver) {
   self._driver = driver;
   self._collection = driver.open(name);
   self._was_snapshot = false;
+  self._allow = {}; // map from 'insert', 'update', 'remove' to function
 
   if (name && manager.registerStore) {
     // OK, we're going to be a slave, replicating some remote
@@ -80,25 +81,27 @@ Meteor.Collection = function (name, manager, driver) {
 
   // mutation methods
   if (manager) {
-    var m = {};
     // XXX what if name has illegal characters in it?
     self._prefix = '/' + name + '/';
-    m[self._prefix + 'insert'] = function (/* selector, options */) {
-      self._maybe_snapshot();
-      return self._collection.insert.apply(self._collection, _.toArray(arguments));
-    };
+    _.each(['insert', 'update', 'remove'], function (op) {
+      var m = {};
+      m[self._prefix + op] = function (/* arguments */) {
+        var allow = self._allow[op];
+        if (allow) {
+          var allowed = allow.apply(this, _.toArray(arguments));
+          if (!allowed) {
+            this.error(401, "Not allowed");
+            return;
+          }
+        }
 
-    m[self._prefix + 'update'] = function (/* selector, mutator, options */) {
-      self._maybe_snapshot();
-      return self._collection.update.apply(self._collection, _.toArray(arguments));
-    };
+        self._maybe_snapshot();
+        return self._collection[op].apply(self._collection,
+                                          _.toArray(arguments));
+      };
 
-    m[self._prefix + 'remove'] = function (/* selector */) {
-      self._maybe_snapshot();
-      return self._collection.remove.apply(self._collection, _.toArray(arguments));
-    };
-
-    manager.methods(m);
+      manager.methods(m);
+    });
   }
 
   // autopublish
@@ -168,4 +171,17 @@ _.extend(Meteor.Collection.prototype, {
     else
       self._collection.remove.apply(self._collection, _.toArray(arguments));
   }
+});
+
+_.each(["insert", "update", "remove"], function (op) {
+  var method_name = "allow" + op.charAt(0).toUpperCase() + op.slice(1);
+
+  Meteor.Collection.prototype[method_name] =
+    function (f) {
+      var self = this;
+      if (op in self._allow)
+        throw new Error("Only one " + method_name +
+                        " function may be set on a collection");
+      self._allow[op] = f;
+    };
 });

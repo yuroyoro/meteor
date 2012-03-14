@@ -64,6 +64,25 @@ App.methods({
 
 Pantry = new Meteor.Collection("pantry");
 
+// When you put something in the panty, you must put in more than one
+// of them. But you can assign them to anyone.
+Pantry.allowInsert(function (doc) {
+  return (doc.quantity && doc.quantity > 1);
+});
+
+// You can only update things in the pantry that belong to you, and
+// you must guard against races by explicitly including a 'who' clause
+// in the selector
+Pantry.allowUpdate(function (selector, modifier) {
+  return ('who' in selector) && this.user === selector.who;
+});
+
+// You can only remove things in the pantry that have a quantity of
+// zero, and ditto
+Pantry.allowRemove(function (selector) {
+  return ('quantity' in selector) && this.quantity === 0;
+});
+
 Meteor.startup(function () {
   if (Meteor.is_server)
     Pantry.remove({}); // XXX can this please be Pantry.remove()?

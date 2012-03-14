@@ -325,6 +325,21 @@ if (Meteor.is_client) {
       });
     }
   ]);
+
+  testAsyncMulti("livedata - database permissions", [
+    function (test, expect) {
+      Pantry.insert({who: "bob", what: "rings", quantity: 1, world: test.runId()});
+      Pantry.insert({who: "bob", what: "chalices", quantity: 3, world: test.runId()});
+      // XXX rewrite test to just get the return value from the
+      // database RPC, not use onQuiesce
+      var release = expect();
+      App.onQuiesce(function () {
+        test.isTrue(_.isEqual(summarizePantry(), {tangelos: 20, orangelos: 2,
+                                                  chalices: 3}));
+        Meteor.defer(release);
+      });
+    }
+  ]);
 }
 // XXX try rerunning subscriptions
 
