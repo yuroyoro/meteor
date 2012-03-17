@@ -135,5 +135,23 @@ Tinytest.add("mongo-livedata - basics", function (test) {
     test.equal(coll.find({run: run}).count(), 0);
   });
 
+  // Some more detailed observe() testing, to make sure the diffing
+  // works. These aren't the only correct answers, but they cover what
+  // our current implementations (on client and server) return.
+
+  expectObserve('a(10,0)a(15,1)a(20,2)a(25,3)a(30,4)', function () {
+    coll.insert({run: run, x: 10});
+    coll.insert({run: run, x: 15});
+    coll.insert({run: run, x: 20});
+    coll.insert({run: run, x: 25});
+    coll.insert({run: run, x: 30});
+  });
+
+  expectObserve('c(0,2,20)m(0,2,0)c(35,1,10)m(35,1,4)', function () {
+    coll.update({run: run, x: 20}, {$set: {x: 0}});
+    coll.update({run: run, x: 10}, {$set: {x: 35}});
+  });
+
+
   obs.stop();
 });
