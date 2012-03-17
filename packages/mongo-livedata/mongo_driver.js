@@ -458,64 +458,146 @@ _Mongo.LiveResultsSet.prototype._doPoll = function () {
   // Get the new query results
   self.cursor.rewind();
   var new_results = self.cursor.fetch();
-  var present_in_new = {}, present_in_old = {};
+  var new_by_id = {}, old_by_id = {};
 
   // Generate some indexes to speed up the process
   _.each(new_results, function (doc) {
-    present_in_new[doc._id] = true;
+    new_by_id[doc._id] = doc;
   });
   _.each(self.results, function (doc) {
-    present_in_old[doc._id] = true;
+    old_by_id[doc._id] = doc;
   });
 
-  // If documents left the query, remove them from self.results
+  // Helper function
+  var findById = function (array, id, start) {
+    for (var j = start || 0; j < array.length; j++)
+      if (array[j]._id === id)
+        return j;
+    throw new Error("Document missing from results?");
+  };
+
+  // Our general strategy will be to transform self.results into
+  // new_results, generating callbacks as we do so so that the user
+  // can follow along.
+
+  // As written, this is potentially N^2. It is going to need some
+  // love.
+
+  // Removes are easy. Handle them first.
   for (var i = 0; i < self.results.length; i++) {
-    if (!(self.results[i]._id in present_in_new)) {
+    if (!(self.results[i]._id in new_by_id)) {
       self.removed && self.removed(self.results[i], i);
       self.results.splice(i, 1);
       i--;
     }
   }
 
-  // Now new_results is a (non-strict) superset of self.results, so we
-  // can be sure that new_results is at least as long as self.results.
-
-  // Transform self.results into new_results
-  // XXX this is O(N^2) in the worst case, but O(N) in typical cases
+  // Figure out which objects either changed, or were newly added.
+  var needs_position = {}; // id -> true
   for (var i = 0; i < new_results.length; i++) {
-    // Newly added documents
-    if (!(new_results[i]._id in present_in_old)) {
-      self.added && self.added(new_results[i], i);
-      self.results.splice(i, 0, new_results[i]);
-      continue;
+    var old = old_by_id[new_results[i]._id];
+    if (!old || !_.isEqual(old, new_results[i]))
+      needs_position[new_results[i]._id] = true;
+  }
+
+  // If items that didn't change, changed position relative to each
+  // other, then conclude that the database isn't giving us the items
+  // in a stable order, and just move every single item.
+  var old_idx = 0;
+  var new_idx = 0;
+  var slow_mode = false;
+  while (true) {
+    // Skip items that need positioning
+    while (old_idx < self.results.length &&
+           needs_position[self.results[old_idx]._id])
+      old_idx++;
+    while (new_idx < new_results.length &&
+           needs_position[new_results[new_idx]._id])
+      new_idx++;
+
+    // Finished?
+    if (old_idx === self.results.length ||
+        new_idx === new_results.length) {
+      if (old_idx !== self.results.length ||
+          new_idx !== new_results.length)
+        throw new Error("Different sizes -- after removes and ignoring adds?");
+      break;
     }
 
-    // Find the offset of new_results[i] in self.results (if
-    // present). Note that we check the most likely case first
-    // (old_offset === i)
-    var old_offset;
-    for (var j = i; j < self.results.length; j++)
-      if (self.results[j]._id === new_results[i]._id) {
-        old_offset = j;
-        break;
-      }
-    if (old_offset === undefined)
-      throw new Error("Document in index, but missing from array?");
-
-    // Changed documents
-    if (!_.isEqual(self.results[old_offset], new_results[i])) {
-      self.changed && self.changed(new_results[i], old_offset,
-                                   self.results[old_offset]);
-      self.results[i] = new_results[i];
-    }
-
-    // Moved documents
-    if (old_offset !== i) {
-      self.moved && self.moved(new_results[i], old_offset, i);
-      self.results.splice(old_offset, 1);
-      self.results.splice(i, 0, new_results[i]);
+    // This pair of objects should be the same, or else objects moved
+    // without changing..
+    if (self.results[old_idx++]._id !== new_results[new_idx++]._id) {
+      slow_mode = true;
+      break;
     }
   }
+
+  if (slow_mode) {
+    Meteor._debug("** Database result order is unstable. Query change notification will be less efficient.");
+    // This is going to be super inefficient both in runtime and in
+    // messages generated, but it should at least be correct.
+    for (var i = 0; i < new_results.length; i++)
+      needs_position[new_results[i]._id] = true;
+  }
+
+  // Take each of those objects and put them into the correct position
+  // relative to any objects that are NOT needs_position. As we do so,
+  // remove them from needs_position, so at the end, needs_position is
+  // empty and everything is positioned.
+  _.each(_.keys(needs_position), function (id) { // NOT for..in, we delete
+    // Find the offset where this object now appears
+    var new_offset = findById(new_results, id);
+
+    // Find the id of the first correctly-positioned item that is
+    // supposed to come before it
+    var previous_id = null; // may still be null at exit (beginning)
+    for (var i = new_offset - 1; i >=0; i--) {
+      var candidate_id = new_results[i]._id;
+      if (!needs_position[candidate_id]) {
+        previous_id = candidate_id;
+        break;
+      }
+    }
+
+    // Make the change
+    if (!(id in old_by_id)) {
+      // Add
+      var add_at_offset = previous_id ?
+        findById(self.results, previous_id) + 1 : 0;
+      self.added && self.added(new_by_id[id], add_at_offset);
+      self.results.splice(add_at_offset, 0, new_by_id[id]);
+    } else {
+      // Move and/or change
+      var old_offset = findById(self.results, id);
+
+      var move_to_offset;
+      if (!previous_id)
+        move_to_offset = 0;
+      else {
+        move_to_offset = findById(self.results, previous_id) + 1;
+        if (old_offset < move_to_offset)
+          // We already appear in the array before
+          // move_to_offset. Take into account that the array will
+          // shift one place to the left when we move.
+          move_to_offset--;
+      }
+
+      // Changed?
+      if (!_.isEqual(new_by_id[id], old_by_id[id])) {
+        self.changed && self.changed(new_by_id[id], old_offset, old_by_id[id]);
+        self.results[old_offset] = new_by_id[id];
+      }
+      // Moved?
+      if (old_offset !== move_to_offset) {
+        self.moved && self.moved(new_by_id[id], old_offset, move_to_offset);
+        self.results.splice(old_offset, 1);
+        self.results.splice(move_to_offset, 0, new_by_id[id]);
+      }
+    }
+
+    // And now one more object is correctly positioned
+    delete needs_position[id];
+  });
 };
 
 _Mongo.LiveResultsSet.prototype.stop = function () {
