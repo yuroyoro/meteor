@@ -37,7 +37,7 @@ testAsyncMulti("mongo-livedata - database failure reporting", [
 Meteor._LivedataTestCollection =
   new Meteor.Collection("livedata_test_collection");
 
-Tinytest.add("mongo-livedata - basics", function (test) {
+Tinytest.addAsync("mongo-livedata - basics", function (test, onComplete) {
   var coll = Meteor._LivedataTestCollection;
   var run = test.runId();
 
@@ -57,7 +57,7 @@ Tinytest.add("mongo-livedata - basics", function (test) {
     }
   });
 
-  var expectObserve = function (expected, f) {
+  var captureObserve = function (f) {
     if (Meteor.is_client) {
       f();
     } else {
@@ -66,11 +66,16 @@ Tinytest.add("mongo-livedata - basics", function (test) {
       fence.armAndWait();
     }
 
+    var ret = log;
+    log = '';
+    return ret;
+  };
+
+  var expectObserve = function (expected, f) {
     if (!(expected instanceof Array))
       expected = [expected];
 
-    test.include(expected, log);
-    log = '';
+    test.include(expected, captureObserve(f));
   };
 
   test.equal(coll.find({run: run}).count(), 0);
@@ -139,6 +144,7 @@ Tinytest.add("mongo-livedata - basics", function (test) {
   // works. These aren't the only correct answers, but they cover what
   // our current implementations (on client and server) return.
 
+/*
   expectObserve('a(10,0)a(15,1)a(20,2)a(25,3)a(30,4)', function () {
     coll.insert({run: run, x: 10});
     coll.insert({run: run, x: 15});
@@ -151,7 +157,99 @@ Tinytest.add("mongo-livedata - basics", function (test) {
     coll.update({run: run, x: 20}, {$set: {x: 0}});
     coll.update({run: run, x: 10}, {$set: {x: 35}});
   });
+*/
 
+  // fuzz test of observe(), especially the server-side diffing
+  var actual = [];
+  var correct = [];
+  var counters = {add: 0, change: 0, move: 0, remove: 0};
 
-  obs.stop();
+  var obs2 = coll.find({run: run}, {sort: ["x"]}).observe({
+    added: function (doc, before_index) {
+      counters.add++;
+      actual.splice(before_index, 0, doc.x);
+    },
+    changed: function (new_doc, at_index, old_doc) {
+      counters.change++;
+      test.equal(actual[at_index], old_doc.x);
+      actual[at_index] = new_doc.x;
+    },
+    moved: function (doc, old_index, new_index) {
+      counters.move++;
+      test.equal(actual[old_index], doc.x);
+      actual.splice(old_index, 1);
+      actual.splice(new_index, 0, doc.x);
+    },
+    removed: function (doc, at_index) {
+      counters.remove++;
+      test.equal(actual[at_index], doc.x);
+      actual.splice(at_index, 1);
+    }
+  });
+
+  // Random integer in [0,n)
+  var rnd = function (n) {
+    return Math.floor(Math.random()*n);
+  };
+
+  var step = 0;
+
+  var doStep = function () {
+    if (step++ === 100) {
+      obs.stop();
+      obs2.stop();
+      onComplete();
+      return;
+    }
+
+    var max_counters = _.clone(counters);
+
+    captureObserve(function () {
+      // Do a batch of 1-5 operations
+      var batch_count = rnd(5) + 1;
+      for (var i = 0; i < batch_count; i++) {
+        // 25% add, 25% remove, 25% change in place, 25% change and move
+        var op = rnd(4);
+        var which = rnd(correct.length);
+        if (op === 0 || step < 2 || !correct.length) {
+          // Add
+          var x = rnd(1000000);
+          coll.insert({run: run, x: x});
+          correct.push(x);
+          max_counters.add++;
+        } else if (op === 1 || op === 2) {
+          var x = correct[which];
+          if (op === 1)
+            // Small change, not likely to cause a move
+            var val = x + (rnd(2) ? -1 : 1);
+          else
+            // Large change, likely to cause a move
+            var val = rnd(1000000);
+          coll.update({run: run, x: x}, {$set: {x: val}});
+          correct[which] = val;
+          max_counters.change++;
+          max_counters.move++;
+        } else {
+          coll.remove({run: run, x: correct[which]});
+          correct.splice(which, 1);
+          max_counters.remove++;
+        }
+      }
+    });
+
+    // Did we actually deliver messages that mutated the array in the
+    // right way?
+    correct.sort(function (a,b) {return a-b;});
+    test.equal(actual, correct);
+
+    // Did we limit ourselves to one 'moved' message per change,
+    // rather than O(results) moved messages?
+    _.each(max_counters, function (v, k) {
+      test.isTrue(max_counters[k] >= counters[k]);
+    });
+
+    Meteor.defer(doStep);
+  };
+
+  doStep();
 });
