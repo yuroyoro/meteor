@@ -672,10 +672,10 @@ Tinytest.add("liveui - chunks", function(test) {
 
   frag.release();
 
+  // calling chunk() outside of render mode
+  test.equal(Meteor.ui.chunk(function() { return "foo"; }), "foo");
+
   // caller violating preconditions
-  test.throws(function() {
-    Meteor.ui.chunk(function() { return "foo"; });
-  });
 
   test.throws(function() {
     Meteor.ui.render(function() {
