@@ -463,3 +463,42 @@ LocalCollection.prototype.restore = function () {
       query.added(LocalCollection._deepcopy(query.results[i]), i);
   }
 };
+
+
+// Pause the observers. No callbacks from observers will fire until
+// 'resumeObservers' is called.
+//
+// If observers are already paused, this is a no-op.
+LocalCollection.prototype.pauseObservers = function () {
+  // XXX implement
+
+  // - Take a snapshot of the query results for each query.
+  // - Set the 'paused' flag such that new observer messages don't fire.
+
+  // - Modify all observer notifiers to respect the paused flag
+
+  // XXX what if we make a new observer while paused?
+  // - deliver inital adds. make immediate snapshot.
+  // or
+  // - deliver nothing. make empty snapshot.
+  // ?
+};
+
+// Resume the observers. Observers immediately receive change
+// notifications to bring them to the current state of the
+// database. Note that this is not just replaying all the changes that
+// happened during the pause, it is a smarter 'coalesced' diff.
+//
+// If the observers are not paused, this is a no-op.
+LocalCollection.prototype.resumeObservers = function () {
+  // XXX implement
+
+  // - for each query:
+  // -- rerun the query
+  // -- compute the diff between the new results and the snapshot
+  // -- send the diff to the observers
+  // -- remove the snapshot
+
+  // - unset the 'paused' flag
+};
+
