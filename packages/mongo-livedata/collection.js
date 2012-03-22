@@ -36,6 +36,11 @@ Meteor.Collection = function (name, manager, driver) {
       // to start by backing out any local writes and returning to the
       // last state delivered by the server.
       beginUpdate: function () {
+
+        // XXX TODO snapshot observers
+        // XXX TODO pause observers
+
+        // restore db snapshot
         if (self._was_snapshot) {
           self._collection.restore();
           self._was_snapshot = false;
@@ -45,6 +50,8 @@ Meteor.Collection = function (name, manager, driver) {
       // Apply an update from the server.
       // XXX better specify this interface (not in terms of a wire message)?
       update: function (msg) {
+        // XXX TODO handle reset message
+
         var doc = self._collection.findOne(msg.id);
 
         if (doc
@@ -69,6 +76,11 @@ Meteor.Collection = function (name, manager, driver) {
       // Called at the end of a batch of updates, just for symmetry,
       // or in case some future database driver needs it.
       endUpdate: function () {
+
+        // XXX TODO rerun queries, and compare with snapshotted observers
+        // XXX TODO send diffs to observers
+        // XXX TODO resume observers
+
       },
 
       // Reset the collection to its original, empty state.

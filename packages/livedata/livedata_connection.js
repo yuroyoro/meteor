@@ -333,7 +333,7 @@ _.extend(Meteor._LivedataConnection.prototype, {
 
     // If we're using the default callback on the server,
     // synchronously return the result from the remote host.
-    if (future) {
+    if (future) { // XXX should this be typeof !== undefined?
       var outcome = future.wait();
       if (outcome[0])
         throw outcome[0];
@@ -397,6 +397,12 @@ _.extend(Meteor._LivedataConnection.prototype, {
     // spurious 'added' and 'removed' messages, which would cause, eg,
     // DOM elements to fail to get semantically matched, leading to a
     // loss of focus/input state.
+
+    // XXX TODO put reset message in pending_data (and clear it, as an optimization)
+    // XXX TODO mark subs uncomplete
+
+    // XXX TODO do _not_ remove database
+
     _.each(self.stores, function (s) { s.reset(); });
     self.pending_data = [];
     self.queued = {};
@@ -408,12 +414,19 @@ _.extend(Meteor._LivedataConnection.prototype, {
     // Add the data message to the queue
     self.pending_data.push(msg);
 
-    // If there are still method invocations in flight, stop
+    // Process satisfied methods and subscriptions
     _.each(msg.methods || [], function (method_id) {
       delete self.unsatisfied_methods[method_id];
     });
+    // XXX TODO process satisfied subscriptions
+    // NOTE: do NOT fire callbacks for subscriptions, that happens when
+    // the data message is processed for real. probably have a separate
+    // set of 'uncomplete' subscriptions.
+
+    // If there are still method invocations in flight, stop
     for (var method_id in self.unsatisfied_methods)
       return;
+    // XXX TODO If there are still uncomplete subscriptions, stop
 
     // All methods have landed. Blow away local changes and replace
     // with authoritative changes from server.
